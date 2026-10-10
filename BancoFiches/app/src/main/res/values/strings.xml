@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Banco Fiches</string>
+    <string name="starting">Avvio del banco…</string>
+    <string name="channel_name">Banco attivo</string>
+    <string name="channel_description">Mostra che il server del banco è acceso</string>
+    <string name="notification_title">Banco Fiches attivo</string>
+    <string name="notification_address">I giocatori aprono %1$s</string>
+    <string name="notification_no_network">Collegati a un Wi-Fi o attiva l\'hotspot</string>
+    <string name="notification_starting">Avvio del server…</string>
+    <string name="notification_stop">Spegni</string>
+    <string name="share_title">Invita al tavolo</string>
+    <string name="share_text">Siediti al tavolo “%1$s”: apri %2$s (stessa rete Wi-Fi del banco)</string>
+</resources>
