@@ -433,6 +433,187 @@ public class GameTest {
         assertTrue(g.stateJson(null, false, null).contains("\"chipValue\":0.05"));
     }
 
+    // ------------------------------------------------------------ blackjack
+
+    private static Game blackjack() {
+        Game g = new Game();
+        Map<String, String> m = new HashMap<String, String>();
+        m.put("game", "blackjack");
+        m.put("bjMin", "10");
+        m.put("bjMax", "500");
+        g.updateSettings(m);
+        return g;
+    }
+
+    private static Map<Integer, int[]> outcomes(Object... pairs) {
+        Map<Integer, int[]> m = new HashMap<Integer, int[]>();
+        for (int i = 0; i < pairs.length; i += 2) {
+            m.put((Integer) pairs[i], (int[]) pairs[i + 1]);
+        }
+        return m;
+    }
+
+    private static int totalWithHouse(Game g) {
+        return total(g) + g.houseNet();
+    }
+
+    @Test
+    public void blackjackBasicRound() {
+        Game g = blackjack();
+        Player a = join(g, "Anna", 1000);
+        Player b = join(g, "Bruno", 1000);
+        Player c = join(g, "Carla", 1000);
+        join(g, "Dario", 1000); // non punta
+        assertTrue(g.stateJson(null, false, null).contains("\"tableName\":\"Tavolo da blackjack\""));
+        g.startHand();
+        assertEquals(Game.STAGE_BJ_BETS, g.stage());
+        g.bjBet(a.id, 50, false);
+        g.bjBet(b.id, 30, false);
+        g.bjBet(b.id, 20, false); // cambia idea
+        g.bjBet(c.id, 10, false);
+        assertEquals(980, b.stack);
+        g.bjDeal();
+        assertEquals(Game.STAGE_BJ_PLAY, g.stage());
+        g.bjSettle(outcomes(a.id, new int[]{Player.BJ_WIN}, b.id, new int[]{Player.BJ_LOSE},
+                c.id, new int[]{Player.BJ_BLACKJACK}), false);
+        assertEquals(Game.STAGE_IDLE, g.stage());
+        assertEquals(1050, a.stack);
+        assertEquals(980, b.stack);
+        assertEquals(1015, c.stack);
+        assertEquals(20 - 50 - 15, g.houseNet());
+        assertEquals(4000, totalWithHouse(g));
+        assertEquals(50, a.lastBet);
+    }
+
+    @Test
+    public void blackjackBetLimits() {
+        final Game g = blackjack();
+        final Player a = join(g, "Anna", 300);
+        g.startHand();
+        expectError(new Runnable() {
+            public void run() {
+                g.bjBet(a.id, 5, false);
+            }
+        });
+        expectError(new Runnable() {
+            public void run() {
+                g.bjBet(a.id, 600, false);
+            }
+        });
+        expectError(new Runnable() {
+            public void run() {
+                g.bjBet(a.id, 400, false);
+            }
+        });
+        expectError(new Runnable() {
+            public void run() {
+                g.bjDeal(); // nessuna puntata
+            }
+        });
+        g.bjBet(a.id, 300, false);
+        assertEquals(0, a.stack);
+        g.bjBet(a.id, 0, false);
+        assertEquals(300, a.stack);
+        assertFalse(a.inHand);
+    }
+
+    @Test
+    public void blackjackSplitAndDouble() {
+        final Game g = blackjack();
+        final Player a = join(g, "Anna", 1000);
+        g.startHand();
+        g.bjBet(a.id, 50, false);
+        g.bjDeal();
+        g.bjSplit(a.id, 0, false);
+        g.bjDouble(a.id, 1, false);
+        assertEquals(850, a.stack); // 50 + 50 (split) + 50 (raddoppio della seconda)
+        assertEquals(150, a.contributed);
+        expectError(new Runnable() {
+            public void run() {
+                g.bjDouble(a.id, 1, false); // già raddoppiata
+            }
+        });
+        expectError(new Runnable() {
+            public void run() {
+                g.bjSurrender(a.id, 0, false); // non dopo lo split
+            }
+        });
+        expectError(new Runnable() {
+            public void run() {
+                g.bjSettle(outcomes(a.id, new int[]{Player.BJ_WIN}), false); // manca una mano
+            }
+        });
+        g.bjSettle(outcomes(a.id, new int[]{Player.BJ_WIN, Player.BJ_LOSE}), false);
+        assertEquals(950, a.stack); // +50 sulla prima, -100 sulla seconda
+        assertEquals(50, g.houseNet());
+    }
+
+    @Test
+    public void blackjackInsuranceAndSurrender() {
+        Game g = blackjack();
+        Player a = join(g, "Anna", 1000);
+        Player b = join(g, "Bruno", 1000);
+        g.startHand();
+        g.bjBet(a.id, 50, false);
+        g.bjBet(b.id, 51, false);
+        g.bjDeal();
+        g.bjInsure(a.id, false);
+        g.bjSurrender(b.id, 0, false);
+        assertEquals(925, a.stack);
+        // Il banco ha blackjack: Anna perde la mano ma l'assicurazione paga 2:1 (pari).
+        g.bjSettle(outcomes(a.id, new int[]{Player.BJ_LOSE}, b.id, new int[]{Player.BJ_LOSE}), true);
+        assertEquals(1000, a.stack);
+        assertEquals(1000 - 51 + 25, b.stack); // resa: torna metà (arrotondata per difetto)
+        assertEquals(26, g.houseNet());
+        assertEquals(2000, totalWithHouse(g));
+    }
+
+    @Test
+    public void blackjackCancelUndoAndModeSwitch() {
+        final Game g = blackjack();
+        Player a = join(g, "Anna", 1000);
+        g.startHand();
+        g.bjBet(a.id, 100, false);
+        g.bjDeal();
+        g.bjDouble(a.id, 0, false);
+        expectError(new Runnable() {
+            public void run() {
+                Map<String, String> m = new HashMap<String, String>();
+                m.put("game", "poker");
+                g.updateSettings(m);
+            }
+        });
+        g.cancelHand();
+        assertEquals(1000, g.players().get(0).stack);
+        g.startHand();
+        g.bjBet(a.id, 100, false);
+        g.bjDeal();
+        g.bjSettle(outcomes(a.id, new int[]{Player.BJ_PUSH}), false);
+        assertEquals(1000, g.players().get(0).stack);
+        g.undo(); // torna prima del pagamento
+        assertEquals(Game.STAGE_BJ_PLAY, g.stage());
+        assertEquals(900, g.players().get(0).stack);
+        assertTrue(g.stateJson(null, false, null).contains("\"hands\":[{\"bet\":100"));
+    }
+
+    @Test
+    public void blackjackLeaveDuringBetsRefunds() {
+        Game g = blackjack();
+        Player a = join(g, "Anna", 1000);
+        join(g, "Bruno", 1000);
+        g.startHand();
+        g.bjBet(a.id, 100, false);
+        g.removePlayer(a.id, false);
+        assertTrue(g.stateJson(null, false, null).contains("\"cashOut\":1000"));
+    }
+
+    @Test
+    public void parseOutcomes() {
+        Map<Integer, int[]> o = FicheServer.parseOutcomes("3=W,L;5=B");
+        assertArrayEquals(new int[]{Player.BJ_WIN, Player.BJ_LOSE}, o.get(3));
+        assertArrayEquals(new int[]{Player.BJ_BLACKJACK}, o.get(5));
+    }
+
     @Test
     public void jsonEscaping() {
         assertEquals("\"a\\\"b\\\\c\\n\\u003c\"", Json.quote("a\"b\\c\n<"));

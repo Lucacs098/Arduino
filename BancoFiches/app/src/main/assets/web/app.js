@@ -47,7 +47,14 @@
     sheet: null,
     inviteUrl: '',
     dragging: false,
-    sound: lsGet('bf_sound') !== '0'
+    sound: lsGet('bf_sound') !== '0',
+    // blackjack
+    bjBet: 0,
+    bjEditing: false,
+    bjSkip: false,
+    bjOut: {},
+    bjDealerBj: false,
+    bjKey: ''
   };
 
   // Link speciali: #a=TOKEN (banco, dall'app) e #t=TOKEN (rientro di un giocatore).
@@ -154,6 +161,7 @@
       setToken('');
       if (S.s && S.s.me != null) toast('Non sei più seduto al tavolo');
     }
+    var prev = S.s;
     S.s = s;
     S.v = s.v;
     var h = s.hand;
@@ -171,10 +179,24 @@
     }
 
     var m = me();
+    if (h.stage === 'bj-bets' || h.stage === 'bj-play') {
+      var bk = h.n + ':' + h.stage;
+      if (bk !== S.bjKey) {
+        S.bjKey = bk;
+        S.bjBet = 0;
+        S.bjEditing = false;
+        S.bjSkip = false;
+        S.bjOut = {};
+        S.bjDealerBj = false;
+        // Il banco ha appena aperto le puntate: avvisiamo chi può puntare.
+        if (h.stage === 'bj-bets' && prev && prev.hand.stage !== 'bj-bets' && m && !m.sittingOut && m.stack > 0) notifyTurn();
+      }
+    }
     var myTurn = !!(m && h.stage === 'betting' && h.toAct === m.id);
     if (myTurn && !S.wasMyTurn) notifyTurn();
     S.wasMyTurn = myTurn;
-    document.title = myTurn ? '🔔 Tocca a te! · Banco Fiches' : s.cfg.tableName + ' · Banco Fiches';
+    var mustBet = !!(m && h.stage === 'bj-bets' && !m.inHand && !m.sittingOut && m.stack > 0 && !S.bjSkip);
+    document.title = myTurn ? '🔔 Tocca a te! · Banco Fiches' : mustBet ? '🔔 Fai la tua puntata · Banco Fiches' : s.cfg.tableName + ' · Banco Fiches';
 
     if (S.sheet && S.sheet.kind === 'player' && !byId(S.sheet.id)) S.sheet = null;
     render();
@@ -232,7 +254,7 @@
       app.innerHTML = mode === 'join' ? joinSkeleton() : '<header id="hdr"></header><main id="view"></main><div id="bar"></div>';
     }
     if (mode === 'join') {
-      setHtml($('#joinTable'), esc(s.cfg.tableName));
+      setHtml($('#joinTable'), esc(s.cfg.tableName) + (s.cfg.game === 'blackjack' ? ' · Blackjack' : ''));
       setHtml($('#joinDyn'), joinDynHtml());
     } else {
       var tabs = tabList();
@@ -271,8 +293,11 @@
   function hdrHtml(tabs) {
     var s = S.s, h = s.hand, sub;
     if (h.stage === 'idle') sub = h.n ? 'Mano #' + h.n + ' conclusa' : 'In attesa della prima mano';
+    else if (h.stage === 'bj-bets') sub = 'Mano #' + h.n + ' · Puntate aperte';
+    else if (h.stage === 'bj-play') sub = 'Mano #' + h.n + ' · Carte in tavola';
     else sub = 'Mano #' + h.n + ' · ' + (h.stage === 'showdown' ? 'Showdown' : h.streetName);
-    if (s.cfg.autoBlinds && s.cfg.bigBlind) sub += ' · Bui ' + fmt(s.cfg.smallBlind) + '/' + fmt(s.cfg.bigBlind);
+    if (isBj()) sub += ' · Blackjack ' + fmt(s.cfg.bjMin) + (s.cfg.bjMax ? '–' + fmt(s.cfg.bjMax) : '+');
+    else if (s.cfg.autoBlinds && s.cfg.bigBlind) sub += ' · Bui ' + fmt(s.cfg.smallBlind) + '/' + fmt(s.cfg.bigBlind);
     return (S.online ? '' : '<div class="offline-banner">Connessione al banco persa… riprovo</div>') +
       '<div class="hdr-row"><div class="logo"></div><div class="hdr-title"><div class="t">' + esc(s.cfg.tableName) + '</div>' +
       '<div class="s">' + esc(sub) + '</div></div>' +
@@ -310,6 +335,7 @@
 
   function potHtml() {
     var s = S.s, h = s.hand;
+    if (isBj() && h.stage !== 'idle') return bjPotHtml();
     if (h.stage === 'idle') {
       return (h.lastResult ? '<div class="result">' + esc(h.lastResult) + '</div>' : '') +
         '<div class="pot idle"><div class="lbl">' + (h.n ? 'Mano #' + h.n + ' conclusa' : 'Benvenuti al tavolo') + '</div>' +
@@ -333,7 +359,9 @@
 
   function hostPanelHtml() {
     var s = S.s, h = s.hand, html = '';
-    if (h.stage === 'idle') {
+    if (isBj()) {
+      return bjHostPanelHtml();
+    } else if (h.stage === 'idle') {
       var eligible = s.players.filter(function (p) { return !p.sittingOut && p.stack > 0; }).length;
       var nd = nextDealer();
       var blinds = s.cfg.autoBlinds && s.cfg.bigBlind > 0
@@ -362,14 +390,17 @@
         '<div class="row"><button class="btn ghost" data-act="cancelHand">Annulla mano</button>' +
         '<button class="btn primary" data-act="award">Assegna vincita</button></div></div>';
     }
-    if (!me() && h.stage === 'idle') {
-      html += '<div class="card turn-line"><div class="grow">Giochi anche tu da questo telefono?</div>' +
-        '<button class="btn small primary" data-act="sitHost">Siediti al tavolo</button></div>';
-    }
-    return html;
+    return html + sitCardHtml();
+  }
+
+  function sitCardHtml() {
+    if (me() || S.s.hand.stage !== 'idle') return '';
+    return '<div class="card turn-line"><div class="grow">Giochi anche tu da questo telefono?</div>' +
+      '<button class="btn small primary" data-act="sitHost">Siediti al tavolo</button></div>';
   }
 
   function seatHtml(p) {
+    if (isBj()) return bjSeatHtml(p);
     var s = S.s, h = s.hand, meId = s.me;
     var inPlay = h.stage !== 'idle';
     var turn = h.stage === 'betting' && h.toAct === p.id;
@@ -397,13 +428,17 @@
     else if (inPlay) sub = 'Entra alla prossima mano';
     if (p.pending > 0) sub += (sub ? ' · ' : '') + '+' + fmt(p.pending) + ' alla prossima mano';
 
+    return seatRow(p, cls, clickable, badge, sub, subCls, p.bet);
+  }
+
+  function seatRow(p, cls, clickable, badge, sub, subCls, bet) {
     return '<div class="' + cls + '"' + (clickable ? ' role="button" tabindex="0" data-act="seat" data-id="' + p.id + '"' : '') + '>' +
       '<div class="avatar" style="background:' + color(p.id) + '">' + esc(initial(p.name)) + badge + '</div>' +
       '<div style="min-width:0"><div class="seat-name"><span class="dot' + (p.online ? ' on' : '') + '"></span>' +
-      '<span class="n">' + esc(p.name) + '</span>' + (p.id === meId ? '<span class="tag">Tu</span>' : '') + '</div>' +
+      '<span class="n">' + esc(p.name) + '</span>' + (p.id === S.s.me ? '<span class="tag">Tu</span>' : '') + '</div>' +
       '<div class="seat-sub ' + subCls + '">' + (sub ? esc(sub) : '&nbsp;') + '</div></div>' +
       '<div class="seat-right"><div class="seat-stack num">' + fmt(p.stack) + '</div>' +
-      (p.bet > 0 ? '<div class="betchip num">' + fmt(p.bet) + '</div>' : '') + '</div></div>';
+      (bet > 0 ? '<div class="betchip num">' + fmt(bet) + '</div>' : '') + '</div></div>';
   }
 
   function logHtml(limit) {
@@ -513,6 +548,7 @@
       return { name: p.name, buyIn: p.buyIn, chips: p.cashOut, left: true };
     }));
     rows.forEach(function (r) { r.net = r.chips - r.buyIn; });
+    if (s.cfg.game === 'blackjack' || s.houseNet) rows.push({ name: 'Banco (casa)', house: true, buyIn: 0, chips: 0, net: s.houseNet });
     return rows;
   }
 
@@ -540,14 +576,15 @@
     var body = rows.map(function (r) {
       tb += r.buyIn; tc += r.chips; tn += r.net;
       return '<tr><td>' + esc(r.name) + (r.left ? ' <span class="muted">(uscito)</span>' : '') + '</td>' +
-        '<td>' + fmt(r.buyIn) + '</td><td>' + fmt(r.chips) + '</td><td>' + signed(r.net) + '</td>' +
+        (r.house ? '<td>—</td><td>—</td>' : '<td>' + fmt(r.buyIn) + '</td><td>' + fmt(r.chips) + '</td>') + '<td>' + signed(r.net) + '</td>' +
         (useMoney ? '<td>' + signed(r.net, true) + '</td>' : '') + '</tr>';
     }).join('');
     var html = '<div class="card"><h3>Bilancio</h3><table class="ledger"><thead><tr><th>Giocatore</th><th>Buy-in</th><th>Fiches</th><th>Netto</th>' +
       (useMoney ? '<th>' + esc(s.cfg.currency || 'Valore') + '</th>' : '') + '</tr></thead><tbody>' + body +
       '<tr class="tot"><td>Totale</td><td>' + fmt(tb) + '</td><td>' + fmt(tc) + '</td><td>' + signed(tn) + '</td>' +
       (useMoney ? '<td>' + signed(tn, true) + '</td>' : '') + '</tr></tbody></table>' +
-      '<p class="muted" style="font-size:13px;margin:10px 0 0">Buy-in = fiches ricevute dal banco. Fiches = fiches attuali (piatto in corso compreso) più quelle già riconsegnate.</p>' +
+      '<p class="muted" style="font-size:13px;margin:10px 0 0">Buy-in = fiches ricevute dal banco. Fiches = fiches attuali (puntate in corso comprese) più quelle già riconsegnate.' +
+      (rows.some(function (r) { return r.house; }) ? ' Banco (casa) = quanto ha vinto o perso il banco al blackjack.' : '') + '</p>' +
       (tn !== 0 ? '<p class="warn" style="margin-top:10px">Il totale non torna di ' + fmt(Math.abs(tn)) + ' fiches: c\'è stata una correzione manuale degli stack.</p>' : '') +
       '</div>';
     var tr = settle(rows);
@@ -566,18 +603,30 @@
     var num = function (name, label, v) {
       return '<label>' + label + '<input class="field" type="number" inputmode="numeric" min="0" step="1" name="' + name + '" value="' + v + '"></label>';
     };
-    return '<div class="card"><h3>Tavolo</h3><form class="form" data-form="settings">' +
+    var bj = c.game === 'blackjack';
+    return '<div class="card"><h3>Gioco</h3><div class="row">' +
+      '<button class="btn' + (bj ? '' : ' primary') + '" data-act="setGame" data-g="poker">♠ Poker</button>' +
+      '<button class="btn' + (bj ? ' primary' : '') + '" data-act="setGame" data-g="blackjack">♣ Blackjack</button></div>' +
+      '<p class="muted" style="font-size:13px;margin:10px 0 0">' + (bj
+        ? 'Blackjack: ognuno punta contro il banco, che paga chi vince e incassa da chi perde.'
+        : 'Poker: tutti puntano in un piatto comune che va a chi vince la mano.') +
+      ' Si può cambiare tra una mano e l\'altra.</p></div>' +
+      '<div class="card"><h3>Tavolo</h3><form class="form" data-form="settings">' +
       '<label>Nome del tavolo<input class="field" name="tableName" maxlength="40" value="' + esc(c.tableName) + '"></label>' +
-      '<div class="grid2">' + num('startingStack', 'Stack iniziale', c.startingStack) + num('ante', 'Ante', c.ante) + '</div>' +
-      '<div class="grid2">' + num('smallBlind', 'Small blind', c.smallBlind) + num('bigBlind', 'Big blind', c.bigBlind) + '</div>' +
-      '<label class="switch"><input type="checkbox" name="autoBlinds"' + chk(c.autoBlinds) + '> Bui automatici a ogni mano (il mazziere gira da solo)</label>' +
+      (bj
+        ? num('startingStack', 'Stack iniziale', c.startingStack) +
+          '<div class="grid2">' + num('bjMin', 'Puntata minima', c.bjMin) + num('bjMax', 'Puntata massima', c.bjMax) + '</div>' +
+          '<div class="hint" style="margin:0">Puntata massima 0 = nessun limite. Il blackjack paga 3:2, l\'assicurazione 2:1.</div>'
+        : '<div class="grid2">' + num('startingStack', 'Stack iniziale', c.startingStack) + num('ante', 'Ante', c.ante) + '</div>' +
+          '<div class="grid2">' + num('smallBlind', 'Small blind', c.smallBlind) + num('bigBlind', 'Big blind', c.bigBlind) + '</div>' +
+          '<label class="switch"><input type="checkbox" name="autoBlinds"' + chk(c.autoBlinds) + '> Bui automatici a ogni mano (il mazziere gira da solo)</label>') +
       '<label>Tagli delle fiches (pulsanti rapidi)<input class="field" name="chips" value="' + esc(c.chips.join(', ')) + '"></label>' +
       '<div class="grid2"><label>Valore di 1 fiche<input class="field" name="chipValue" inputmode="decimal" value="' + (c.chipValue || '') + '" placeholder="es. 0,01"></label>' +
       '<label>Valuta<input class="field" name="currency" maxlength="5" value="' + esc(c.currency) + '"></label></div>' +
       '<label class="switch"><input type="checkbox" name="locked"' + chk(c.locked) + '> Tavolo chiuso a nuovi giocatori</label>' +
       '<button class="btn primary big">Salva</button></form></div>' +
-      '<div class="card"><h4>Livelli</h4><div class="row"><button class="btn" data-act="doubleBlinds">Raddoppia i bui (' +
-      fmt(c.smallBlind * 2) + '/' + fmt(c.bigBlind * 2) + ')</button></div></div>' +
+      (bj ? '' : '<div class="card"><h4>Livelli</h4><div class="row"><button class="btn" data-act="doubleBlinds">Raddoppia i bui (' +
+      fmt(c.smallBlind * 2) + '/' + fmt(c.bigBlind * 2) + ')</button></div></div>') +
       '<div class="card"><h4>Questo telefono</h4><div class="row">' +
       '<button class="btn" data-act="sound">' + (S.sound ? '🔔 Suoni attivi' : '🔕 Suoni spenti') + '</button>' +
       (me() ? '' : '<button class="btn primary" data-act="sitHost">Siediti al tavolo</button>') + '</div></div>' +
@@ -600,19 +649,211 @@
       '<button class="btn" data-act="sound">' + (S.sound ? '🔔 Suoni attivi' : '🔕 Suoni spenti') + '</button>' +
       '<button class="btn danger" data-act="selfLeave">Lascia il tavolo</button></div></div>' +
       '<div class="card"><h4>Come funziona</h4><ol class="steps">' +
-      '<li>Le carte sono vere: qui ci sono solo le fiches.</li>' +
-      '<li>Quando tocca a te il telefono vibra e compaiono i pulsanti Fold, Check/Chiama e Punta/Rilancia.</li>' +
-      '<li>Per rilanciare tocca le fiches per aggiungere l\'importo, poi conferma.</li>' +
-      '<li>Alla fine della mano il banco assegna il piatto a chi vince.</li></ol></div>';
+      '<li>Le carte sono vere: qui ci sono solo le fiches.</li>' + (isBj()
+        ? '<li>Quando il banco apre le puntate il telefono vibra: componi la puntata toccando le fiches e conferma.</li>' +
+          '<li>Dopo la distribuzione, dalla barra in basso puoi raddoppiare, dividere, assicurarti o arrenderti.</li>' +
+          '<li>Alla fine il banco segna l\'esito e paga: vincita 1:1, blackjack 3:2, pari restituisce la puntata.</li>'
+        : '<li>Quando tocca a te il telefono vibra e compaiono i pulsanti Fold, Check/Chiama e Punta/Rilancia.</li>' +
+          '<li>Per rilanciare tocca le fiches per aggiungere l\'importo, poi conferma.</li>' +
+          '<li>Alla fine della mano il banco assegna il piatto a chi vince.</li>') + '</ol></div>';
+  }
+
+  // --- blackjack ---
+  var OUTCOME_LABELS = { L: 'Perde', P: 'Pari', W: 'Vince', B: 'Blackjack' };
+
+  function isBj() { return S.s.cfg.game === 'blackjack'; }
+
+  function bjHandsText(p) {
+    return p.hands.map(function (x) {
+      return fmt(x.bet) + (x.doubled ? ' (raddoppio)' : '') + (x.outcome === 5 ? ' (resa)' : '');
+    }).join(' · ') + (p.insurance ? ' · assicurazione ' + fmt(p.insurance) : '');
+  }
+
+  function bjMaxFor(p) {
+    var c = S.s.cfg, avail = p.stack + (p.inHand ? p.contributed : 0);
+    return c.bjMax > 0 ? Math.min(c.bjMax, avail) : avail;
+  }
+
+  function bjAmount(p) {
+    var c = S.s.cfg;
+    return clamp(S.bjBet || (p.inHand ? p.contributed : 0) || p.lastBet || c.bjMin, c.bjMin, bjMaxFor(p));
+  }
+
+  function bjOutcome(p, i) {
+    if (p.hands[i].outcome === 5) return 'S';
+    var o = S.bjOut[p.id];
+    return o && o[i] ? o[i] : '';
+  }
+
+  function bjPotHtml() {
+    var h = S.s.hand, bets = h.stage === 'bj-bets';
+    var n = S.s.players.filter(function (p) { return p.inHand; }).length;
+    return '<div class="pot"><div class="lbl">Blackjack · mano #' + h.n + '</div>' +
+      '<div class="amt num"><span class="stack-ico"></span>' + fmt(h.potTotal) + '</div>' +
+      '<div class="sub">' + (bets ? 'Puntate aperte: fate il vostro gioco' : 'Fiches in gioco di ' + n + (n === 1 ? ' giocatore' : ' giocatori')) + '</div>' +
+      '<div class="street">' + (bets ? 'Puntate' : 'Carte in tavola') + '</div></div>';
+  }
+
+  function bjHostPanelHtml() {
+    var s = S.s, h = s.hand, c = s.cfg, html;
+    if (h.stage === 'idle') {
+      var el = s.players.filter(function (p) { return !p.sittingOut && p.stack > 0; }).length;
+      return '<div class="card host-panel"><button class="btn primary big" data-act="start"' + (el < 1 ? ' disabled' : '') + '>▶ Nuova mano</button>' +
+        '<div class="info">' + (el < 1 ? 'Invita almeno un giocatore dalla scheda “Invita”'
+          : 'Si aprono le puntate · da ' + fmt(c.bjMin) + (c.bjMax ? ' a ' + fmt(c.bjMax) : ' in su') + ' · blackjack paga 3:2') +
+        '</div></div>' + sitCardHtml();
+    }
+    if (h.stage === 'bj-bets') {
+      var players = s.players.filter(function (p) { return !p.sittingOut && (p.stack > 0 || p.inHand); });
+      var done = players.filter(function (p) { return p.inHand; });
+      var waiting = players.filter(function (p) { return !p.inHand; });
+      return '<div class="card host-panel"><h3>Puntate: ' + done.length + ' di ' + players.length + '</h3>' +
+        '<p class="muted" style="margin:0 0 12px">' + (waiting.length
+          ? 'Mancano: ' + waiting.map(function (p) { return esc(p.name); }).join(', ') + '. Chi non punta salta la mano.'
+          : 'Hanno puntato tutti.') + '</p>' +
+        '<div class="row"><button class="btn ghost" data-act="cancelHand">Annulla mano</button>' +
+        '<button class="btn primary" data-act="bjDeal"' + (done.length ? '' : ' disabled') + '>Chiudi e distribuisci</button></div></div>';
+    }
+    var playing = s.players.filter(function (p) { return p.inHand; });
+    html = '<div class="card host-panel"><h3>Esito delle mani</h3>' +
+      '<div class="quick" style="margin:0 0 6px"><button data-act="bjAll" data-o="W">Tutti vincono</button>' +
+      '<button data-act="bjAll" data-o="P">Tutti pari</button><button data-act="bjAll" data-o="L">Tutti perdono</button></div>';
+    playing.forEach(function (p) {
+      p.hands.forEach(function (x, i) {
+        var cur = bjOutcome(p, i);
+        html += '<div class="pot-pick"><div class="pp-title">' + esc(p.name) + (p.hands.length > 1 ? ' · mano ' + (i + 1) : '') +
+          ' · <span class="num">' + fmt(x.bet) + '</span>' + (x.doubled ? ' <span class="tag">raddoppio</span>' : '') + '</div>';
+        if (x.outcome === 5) {
+          html += '<div class="muted">Si è arreso: riceve ' + fmt(Math.floor(x.bet / 2)) + '</div>';
+        } else {
+          html += '<div class="picks bj4">' + ['L', 'P', 'W', 'B'].map(function (o) {
+            return '<button class="pick' + (cur === o ? ' on' : '') + '" data-act="bjOut" data-id="' + p.id + '" data-h="' + i + '" data-o="' + o + '">' + OUTCOME_LABELS[o] + '</button>';
+          }).join('') + '</div>';
+        }
+        html += '</div>';
+      });
+    });
+    if (playing.some(function (p) { return p.insurance > 0; })) {
+      html += '<div class="pot-pick"><button class="pick' + (S.bjDealerBj ? ' on' : '') + '" data-act="bjDealer">Il banco ha fatto blackjack</button>' +
+        '<div class="hint" style="margin-bottom:0">Se sì, l\'assicurazione paga 2:1.</div></div>';
+    }
+    return html + '<div class="hint">Vince paga 1:1, Blackjack 3:2, Pari restituisce la puntata.</div>' +
+      '<div class="row"><button class="btn ghost" data-act="cancelHand">Annulla mano</button>' +
+      '<button class="btn primary" data-act="bjPay">Paga</button></div></div>';
+  }
+
+  function bjSeatHtml(p) {
+    var s = S.s, h = s.hand, meId = s.me;
+    var cls = 'seat';
+    if (p.id === meId) cls += ' me';
+    if ((h.stage === 'bj-play' && !p.inHand) || (h.stage !== 'bj-play' && (p.sittingOut || (p.stack === 0 && !p.inHand)))) cls += ' out';
+    var clickable = s.admin || p.id === meId;
+    if (clickable) cls += ' click';
+    var sub = '', subCls = '';
+    if (h.stage === 'bj-bets') {
+      if (p.inHand) sub = 'Punta ' + fmt(p.contributed);
+      else if (p.sittingOut) sub = 'In pausa';
+      else if (p.stack === 0) sub = 'Senza fiches';
+      else { sub = 'Sta scegliendo la puntata…'; subCls = 'hot'; }
+    } else if (h.stage === 'bj-play') {
+      sub = p.inHand ? bjHandsText(p) : (p.sittingOut ? 'In pausa' : 'Non gioca questa mano');
+    } else if (p.sittingOut) {
+      sub = 'In pausa';
+    } else if (p.stack === 0) {
+      sub = 'Senza fiches';
+    }
+    if (p.pending > 0) sub += (sub ? ' · ' : '') + '+' + fmt(p.pending) + ' alla prossima mano';
+    return seatRow(p, cls, clickable, '', sub, subCls, p.contributed);
+  }
+
+  /** Pulsanti per raddoppiare/dividere/arrendersi/assicurarsi (per sé o, dal banco, per un giocatore). */
+  function bjHandControls(p, forHost) {
+    var pid = forHost ? ' data-pid="' + p.id + '"' : '';
+    var html = '<div class="bj-hands">';
+    var anyOpen = false;
+    p.hands.forEach(function (x, i) {
+      var open = x.outcome === 0 && !x.doubled;
+      if (x.outcome === 0) anyOpen = true;
+      var btns = '';
+      if (open && p.stack >= x.bet) btns += '<button class="btn small" data-act="bjDo" data-op="double" data-h="' + i + '"' + pid + '>Raddoppia</button>';
+      if (open && p.hands.length < 4 && p.stack >= x.bet) btns += '<button class="btn small" data-act="bjDo" data-op="split" data-h="' + i + '"' + pid + '>Dividi</button>';
+      if (open && p.hands.length === 1) btns += '<button class="btn small ghost" data-act="bjDo" data-op="surrender" data-h="' + i + '"' + pid + '>Resa</button>';
+      html += '<div class="bj-line"><span>' + (p.hands.length > 1 ? 'Mano ' + (i + 1) : 'Puntata') + ' <b class="num">' + fmt(x.bet) + '</b>' +
+        (x.doubled ? ' <span class="tag">raddoppio</span>' : '') + (x.outcome === 5 ? ' <span class="tag">resa</span>' : '') + '</span>' +
+        (btns ? '<span class="bj-btns">' + btns + '</span>' : '') + '</div>';
+    });
+    var ins = Math.floor(p.baseBet / 2);
+    if (p.insurance) {
+      html += '<div class="bj-line"><span>Assicurazione <b class="num">' + fmt(p.insurance) + '</b></span></div>';
+    } else if (anyOpen && ins >= 1 && p.stack >= ins) {
+      html += '<div class="bj-line"><span class="muted">Il banco mostra un asso?</span><span class="bj-btns">' +
+        '<button class="btn small" data-act="bjDo" data-op="insure"' + pid + '>Assicurazione ' + fmt(ins) + '</button></span></div>';
+    }
+    return html + '</div>';
+  }
+
+  function bjBarHtml(m) {
+    var s = S.s, h = s.hand, c = s.cfg;
+    var placed = m.inHand ? m.contributed : 0;
+    var info = function (left) {
+      return '<div class="bar-info" style="padding-bottom:2px">' + left + '<span class="grow"></span><span>Fiches <b class="num">' + fmt(m.stack) + '</b></span></div>';
+    };
+    if (h.stage === 'bj-bets' && !m.sittingOut && (m.stack > 0 || placed)) {
+      if (placed && !S.bjEditing) {
+        return '<div class="bar-inner">' + info('<span>Hai puntato <b class="num">' + fmt(placed) + '</b> · in attesa delle carte</span>') +
+          '<div class="act-row" style="margin-top:8px"><button class="act cancel" data-act="bjWithdraw">Ritira</button>' +
+          '<button class="act call" data-act="bjEdit">Cambia puntata</button></div></div>';
+      }
+      if (S.bjSkip && !placed) {
+        return '<div class="bar-inner">' + info('<span>Salti questa mano</span>') +
+          '<div class="act-row" style="margin-top:8px"><button class="act call" data-act="bjUnskip">Punta comunque</button></div></div>';
+      }
+      if (bjMaxFor(m) < c.bjMin) {
+        return '<div class="bar-inner">' + info('<span>Servono almeno ' + fmt(c.bjMin) + ' fiches per puntare: chiedi una ricarica</span>') + '</div>';
+      }
+      var amt = bjAmount(m), max = bjMaxFor(m);
+      return '<div class="bar-inner turn"><div class="bar-info"><span class="pulse"></span><span class="who">Fai la tua puntata</span>' +
+        '<span class="grow"></span><span>Fiches <b class="num">' + fmt(m.stack) + '</b></span></div>' +
+        '<div class="raise"><div class="raise-head"><span>Punta</span><b class="num">' + fmt(amt) + '</b><small>' +
+        (amt >= max ? 'massimo' : 'min ' + fmt(c.bjMin) + (c.bjMax ? ' · max ' + fmt(c.bjMax) : '')) + '</small></div>' +
+        '<div class="chips-row">' + chipsHtml('bjChip') + '<button class="chip reset" data-act="bjReset" aria-label="Riparti dal minimo">↺</button></div>' +
+        '<div class="presets" style="grid-template-columns:repeat(3,1fr)"><button data-act="bjPreset" data-p="min">Minimo</button>' +
+        '<button data-act="bjPreset" data-p="last"' + (m.lastBet ? '' : ' disabled') + '>Come prima</button>' +
+        '<button data-act="bjPreset" data-p="max">Massimo</button></div></div>' +
+        '<div class="act-row"><button class="act cancel" data-act="' + (placed ? 'bjEditClose' : 'bjSkip') + '">' + (placed ? 'Indietro' : 'Salto la mano') + '</button>' +
+        '<button class="act confirm" data-act="bjConfirm" data-v="' + amt + '">' + (placed ? 'Cambia in ' : 'Punta ') + fmt(amt) + '</button></div></div>';
+    }
+    if (h.stage === 'bj-play' && m.inHand) {
+      return '<div class="bar-inner"><div class="bar-info"><span class="who">Le tue mani</span><span class="grow"></span>' +
+        '<span>Fiches <b class="num">' + fmt(m.stack) + '</b></span></div>' + bjHandControls(m, false) + '</div>';
+    }
+    if (S.tab !== 'table') return '';
+    var status = m.sittingOut ? 'In pausa' : h.stage === 'bj-play' ? 'Non giochi questa mano'
+      : (m.stack > 0 ? 'In attesa della mano' : 'Chiedi una ricarica al banco');
+    return '<div class="bar-inner">' + info('<span>' + status + '</span>') + '</div>';
+  }
+
+  function bjSheetHtml(p) {
+    if (!isBj()) return '';
+    var h = S.s.hand;
+    if (h.stage === 'bj-bets' && !p.sittingOut) {
+      return '<div class="card" style="padding:12px"><h4>Blackjack</h4><div class="row">' +
+        '<button class="btn primary" data-act="bjBetFor">' + (p.inHand ? 'Cambia puntata (' + fmt(p.contributed) + ')' : 'Punta per ' + esc(p.name)) + '</button>' +
+        (p.inHand ? '<button class="btn" data-act="bjWithdrawFor">Ritira puntata</button>' : '') + '</div></div>';
+    }
+    if (h.stage === 'bj-play' && p.inHand) {
+      return '<div class="card" style="padding:12px"><h4>Mani in gioco</h4>' + bjHandControls(p, true) + '</div>';
+    }
+    return '';
   }
 
   // --- barra azioni ---
   var CHIP_COLORS = [['#f2f2f2', '#2f6fd6', 1], ['#d63a3a'], ['#2e9d5b'], ['#202020'], ['#2f6fd6'], ['#8e44ad'], ['#e67e22'], ['#e0b52d', '#7a5a00', 1]];
 
-  function chipsHtml() {
+  function chipsHtml(act) {
     return S.s.cfg.chips.map(function (v, i) {
       var c = CHIP_COLORS[i % CHIP_COLORS.length];
-      return '<button class="chip' + (c[2] ? ' light' : '') + '" style="--c:' + c[0] + (c[1] ? ';--s:' + c[1] : '') + '" data-act="addChip" data-v="' + v + '">+' + short(v) + '</button>';
+      return '<button class="chip' + (c[2] ? ' light' : '') + '" style="--c:' + c[0] + (c[1] ? ';--s:' + c[1] : '') + '" data-act="' + (act || 'addChip') + '" data-v="' + v + '">+' + short(v) + '</button>';
     }).join('');
   }
 
@@ -622,6 +863,7 @@
 
   function barHtml() {
     var s = S.s, h = s.hand, m = me(), t = turnPlayer();
+    if (isBj()) return m ? bjBarHtml(m) : '';
     var myTurn = m && t && t.id === m.id;
     var forOther = s.admin && S.actFor && t && !myTurn;
     if ((myTurn || forOther) && h.options) return actionPanel(t, !myTurn);
@@ -702,7 +944,7 @@
           '<button class="btn danger" data-act="selfLeave">Lascia il tavolo</button></div>';
       }
       var b = function (k, label, cls) { return '<button class="btn' + (cls ? ' ' + cls : '') + '" data-act="pAct" data-k="' + k + '">' + label + '</button>'; };
-      return sheetHead(p.name, p) + '<div class="grid-actions">' +
+      return sheetHead(p.name, p) + bjSheetHtml(p) + '<div class="grid-actions">' +
         b('rebuy', '＋ Ricarica fiches') + b('cashout', '－ Ritira fiches') +
         b('fix', '✎ Correggi stack') + b('dealer', 'Ⓓ Fai mazziere') +
         b('up', '↑ Sposta su') + b('down', '↓ Sposta giù') +
@@ -908,6 +1150,75 @@
       confirmBox({ title: 'Lasciare il tavolo?', text: 'Le tue fiches tornano al banco. Potrai sederti di nuovo come nuovo giocatore.', ok: 'Lascia', danger: true,
         onOk: function () { api('leave'); } });
     },
+    setGame: function (el) {
+      var g = el.getAttribute('data-g');
+      if (g === S.s.cfg.game) return;
+      api('settings', { game: g }).then(function (j) { if (j) toast(g === 'blackjack' ? 'Ora si gioca a blackjack' : 'Ora si gioca a poker'); });
+    },
+    bjChip: function (el) { var m = me(); S.bjBet = clamp(bjAmount(m) + Number(el.getAttribute('data-v')), S.s.cfg.bjMin, bjMaxFor(m)); render(); },
+    bjReset: function () { S.bjBet = S.s.cfg.bjMin; render(); },
+    bjPreset: function (el) {
+      var m = me(), k = el.getAttribute('data-p'), c = S.s.cfg;
+      S.bjBet = clamp(k === 'max' ? bjMaxFor(m) : k === 'last' ? m.lastBet : c.bjMin, c.bjMin, bjMaxFor(m));
+      render();
+    },
+    bjConfirm: function (el) {
+      api('bjbet', { amount: el.getAttribute('data-v') }).then(function (j) { if (j) { S.bjEditing = false; S.bjBet = 0; render(); } });
+    },
+    bjSkip: function () { S.bjSkip = true; render(); },
+    bjUnskip: function () { S.bjSkip = false; render(); },
+    bjEdit: function () { S.bjEditing = true; S.bjBet = 0; render(); },
+    bjEditClose: function () { S.bjEditing = false; render(); },
+    bjWithdraw: function () { api('bjbet', { amount: 0 }).then(function (j) { if (j) { S.bjEditing = false; render(); } }); },
+    bjDeal: function () { api('bjdeal'); },
+    bjOut: function (el) {
+      var id = Number(el.getAttribute('data-id')), i = Number(el.getAttribute('data-h')), o = el.getAttribute('data-o');
+      var arr = (S.bjOut[id] || []).slice();
+      arr[i] = arr[i] === o ? '' : o;
+      S.bjOut[id] = arr;
+      render();
+    },
+    bjAll: function (el) {
+      var o = el.getAttribute('data-o');
+      S.s.players.forEach(function (p) {
+        if (p.inHand) S.bjOut[p.id] = p.hands.map(function (x) { return x.outcome === 5 ? 'S' : o; });
+      });
+      render();
+    },
+    bjDealer: function () { S.bjDealerBj = !S.bjDealerBj; render(); },
+    bjPay: function () {
+      var parts = [], missing = null;
+      S.s.players.forEach(function (p) {
+        if (!p.inHand) return;
+        var codes = p.hands.map(function (x, i) { var o = bjOutcome(p, i); if (!o && !missing) missing = p.name; return o; });
+        parts.push(p.id + '=' + codes.join(','));
+      });
+      if (missing) { toast('Scegli l\'esito delle mani di ' + missing, true); return; }
+      api('bjsettle', { o: parts.join(';'), dbj: S.bjDealerBj ? '1' : '0' });
+    },
+    bjDo: function (el) {
+      var op = el.getAttribute('data-op');
+      var params = { hand: el.getAttribute('data-h') || '0' };
+      if (el.getAttribute('data-pid')) params.pid = el.getAttribute('data-pid');
+      var path = { double: 'bjdouble', split: 'bjsplit', surrender: 'bjsurrender', insure: 'bjinsure' }[op];
+      if (op === 'surrender') {
+        confirmBox({ title: 'Arrendersi?', text: 'Rinunci alla mano e riavrai metà della puntata.', ok: 'Mi arrendo', danger: true,
+          onOk: function () { api(path, params); } });
+        return;
+      }
+      api(path, params);
+    },
+    bjBetFor: function () {
+      var p = byId(S.sheet.id), c = S.s.cfg;
+      if (!p) return;
+      var quick = [c.bjMin];
+      if (p.lastBet && quick.indexOf(p.lastBet) < 0) quick.push(p.lastBet);
+      amountBox({ title: 'Puntata di ' + p.name, label: 'Fiches da puntare', value: p.inHand ? p.contributed : (p.lastBet || c.bjMin), quick: quick,
+        ok: 'Punta', back: { kind: 'player', id: p.id },
+        hint: 'Minimo ' + fmt(c.bjMin) + (c.bjMax ? ', massimo ' + fmt(c.bjMax) : '') + '. Ha ' + fmt(p.stack + (p.inHand ? p.contributed : 0)) + ' fiches.',
+        onSubmit: function (v) { return api('bjbet', { pid: p.id, amount: v }); } });
+    },
+    bjWithdrawFor: function () { var p = byId(S.sheet.id); if (p) api('bjbet', { pid: p.id, amount: 0 }); },
     pAct: function (el) {
       var k = el.getAttribute('data-k'), p = byId(S.sheet.id);
       if (!p) return;
@@ -982,12 +1293,12 @@
       if (!name) return;
       api('join', { name: name }).then(function (j) { if (j) { S.tab = 'table'; render(); } });
     } else if (kind === 'settings') {
-      var el = f.elements;
-      api('settings', {
-        tableName: el.tableName.value, startingStack: el.startingStack.value, ante: el.ante.value,
-        smallBlind: el.smallBlind.value, bigBlind: el.bigBlind.value, autoBlinds: el.autoBlinds.checked ? '1' : '0',
-        chips: el.chips.value, chipValue: el.chipValue.value || '0', currency: el.currency.value, locked: el.locked.checked ? '1' : '0'
-      }).then(function (j) { if (j) toast('Impostazioni salvate'); });
+      var data = {};
+      Array.prototype.forEach.call(f.elements, function (el) {
+        if (el.name) data[el.name] = el.type === 'checkbox' ? (el.checked ? '1' : '0') : el.value;
+      });
+      if (data.chipValue === '') data.chipValue = '0';
+      api('settings', data).then(function (j) { if (j) toast('Impostazioni salvate'); });
     } else if (kind === 'sheet') {
       var sh = S.sheet, raw = f.elements.v.value;
       if (!sh) return;

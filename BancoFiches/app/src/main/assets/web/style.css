@@ -329,3 +329,15 @@ ol.steps { margin: 0; padding-left: 20px; display: grid; gap: 6px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before { animation: none !important; transition: none !important; }
 }
+
+/* ---------- blackjack ---------- */
+.bj-hands { display: grid; gap: 8px; }
+.bj-line {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
+  padding: 8px 10px; border-radius: 12px; background: rgba(255,255,255,.05); font-size: 15px;
+}
+.bj-btns { display: flex; gap: 6px; flex-wrap: wrap; }
+.presets button[disabled] { opacity: .4; pointer-events: none; }
+.picks.bj4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.picks.bj4 .pick { padding: 10px 2px; font-size: 14px; text-align: center; }
+.picks.bj4 .pick.on::before { content: ""; }

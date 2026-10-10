@@ -29,6 +29,15 @@ public final class Game {
     public static final int STAGE_IDLE = 0;
     public static final int STAGE_BETTING = 1;
     public static final int STAGE_SHOWDOWN = 2;
+    /** Blackjack: puntate aperte (ognuno sceglie quanto puntare). */
+    public static final int STAGE_BJ_BETS = 3;
+    /** Blackjack: carte distribuite, si gioca e poi il banco paga. */
+    public static final int STAGE_BJ_PLAY = 4;
+
+    public static final String GAME_POKER = "poker";
+    public static final String GAME_BLACKJACK = "blackjack";
+    static final String DEFAULT_NAME_POKER = "Tavolo da poker";
+    static final String DEFAULT_NAME_BLACKJACK = "Tavolo da blackjack";
 
     static final String[] STREETS = {"Pre-flop", "Flop", "Turn", "River"};
     static final int MAX_CHIPS = 100_000_000;
@@ -39,7 +48,7 @@ public final class Game {
     /** Impostazioni del tavolo (non coinvolte dall'annulla). */
     public static final class Settings implements Serializable {
         private static final long serialVersionUID = 1L;
-        String tableName = "Tavolo da poker";
+        String tableName = DEFAULT_NAME_POKER;
         int startingStack = 1000;
         int smallBlind = 5;
         int bigBlind = 10;
@@ -50,6 +59,11 @@ public final class Game {
         double chipValue = 0;
         String currency = "€";
         boolean locked = false;
+        /** "poker" (piatto comune) o "blackjack" (si gioca contro il banco). */
+        String game = GAME_POKER;
+        int bjMin = 10;
+        /** Puntata massima al blackjack (0 = nessun limite). */
+        int bjMax = 500;
     }
 
     /** Stato annullabile: giocatori e mano in corso. */
@@ -70,6 +84,8 @@ public final class Game {
         int toActId = -1;
         ArrayList<Pot> pots = new ArrayList<Pot>();
         String lastResult = "";
+        /** Risultato del banco al blackjack: positivo = il banco ha incassato. */
+        int houseNet = 0;
     }
 
     static final class Pot implements Serializable {
@@ -218,7 +234,14 @@ public final class Game {
         return t;
     }
 
+    private boolean blackjack() {
+        return GAME_BLACKJACK.equals(cfg.game);
+    }
+
     private boolean playerLocked(Player p) {
+        if (st.stage == STAGE_BJ_BETS) {
+            return false; // la puntata è già fuori dallo stack: le fiches si possono toccare
+        }
         return st.stage != STAGE_IDLE && p.inHand && !p.folded;
     }
 
@@ -317,10 +340,11 @@ public final class Game {
 
     public synchronized void removePlayer(int pid, boolean byHost) {
         Player p = require(pid);
-        if (st.stage != STAGE_IDLE && p.inHand) {
+        if (st.stage != STAGE_IDLE && st.stage != STAGE_BJ_BETS && p.inHand) {
             throw new GameException("Aspetta la fine della mano per far uscire " + p.name);
         }
         pushUndo((byHost ? "Rimozione di " : "Uscita di ") + p.name);
+        refundBjBet(p);
         int idx = indexOf(pid);
         if (st.dealerId == pid && st.players.size() > 1) {
             // Il bottone passa al posto successivo alla prossima mano.
@@ -342,6 +366,9 @@ public final class Game {
     public synchronized void setSittingOut(int pid, boolean value) {
         Player p = require(pid);
         if (p.sittingOut != value) {
+            if (value && st.stage == STAGE_BJ_BETS && p.inHand) {
+                refundBjBet(p);
+            }
             p.sittingOut = value;
             log(p.name + (value ? " salta le prossime mani" : " torna in gioco"));
             changed();
@@ -440,6 +467,10 @@ public final class Game {
     public synchronized void startHand() {
         if (st.stage != STAGE_IDLE) {
             throw new GameException("C'è già una mano in corso");
+        }
+        if (blackjack()) {
+            startBlackjack();
+            return;
         }
         if (count(M_ELIGIBLE) < 2) {
             throw new GameException("Servono almeno 2 giocatori con fiches e non in pausa");
@@ -923,6 +954,281 @@ public final class Game {
     }
 
     // ------------------------------------------------------------------
+    // Blackjack: ognuno gioca contro il banco
+    // ------------------------------------------------------------------
+
+    static final String[] OUTCOMES = {"", "perde", "pari", "vince", "blackjack", "resa"};
+
+    private void startBlackjack() {
+        if (count(M_ELIGIBLE) < 1) {
+            throw new GameException("Serve almeno un giocatore con fiches e non in pausa");
+        }
+        pushUndo("Nuova mano");
+        st.handNumber++;
+        st.street = 0;
+        st.pots.clear();
+        st.lastResult = "";
+        st.toActId = -1;
+        st.currentBet = 0;
+        st.sbId = -1;
+        st.bbId = -1;
+        for (Player p : st.players) {
+            p.resetHand();
+        }
+        st.stage = STAGE_BJ_BETS;
+        log("Mano #" + st.handNumber + " — blackjack: puntate aperte");
+        changed();
+    }
+
+    /** Durante le puntate restituisce la puntata già fatta. */
+    private void refundBjBet(Player p) {
+        if (st.stage == STAGE_BJ_BETS && p.inHand) {
+            p.stack += p.contributed;
+            p.resetHand();
+        }
+    }
+
+    private static String byHostNote(boolean byHost) {
+        return byHost ? " (dal banco)" : "";
+    }
+
+    static String signed(int n) {
+        return n > 0 ? "+" + fmt(n) : n < 0 ? "−" + fmt(-n) : "0";
+    }
+
+    /** Punta (o cambia la puntata). amount = 0 ritira la puntata. */
+    public synchronized void bjBet(int pid, int amount, boolean byHost) {
+        if (st.stage != STAGE_BJ_BETS) {
+            throw new GameException("Le puntate sono chiuse");
+        }
+        Player p = require(pid);
+        if (amount == 0) {
+            if (!p.inHand) {
+                return;
+            }
+            pushUndo(p.name + ": ritira la puntata");
+            refundBjBet(p);
+            log(p.name + " ritira la puntata" + byHostNote(byHost));
+            changed();
+            return;
+        }
+        if (p.sittingOut) {
+            throw new GameException(p.name + " è in pausa");
+        }
+        if (amount < cfg.bjMin) {
+            throw new GameException("La puntata minima è " + fmt(cfg.bjMin));
+        }
+        if (cfg.bjMax > 0 && amount > cfg.bjMax) {
+            throw new GameException("La puntata massima è " + fmt(cfg.bjMax));
+        }
+        int available = p.stack + p.contributed;
+        if (amount > available) {
+            throw new GameException(p.name + " ha solo " + fmt(available) + " fiches");
+        }
+        boolean change = p.inHand;
+        pushUndo(p.name + ": punta " + fmt(amount));
+        p.stack = available - amount;
+        p.resetHand();
+        p.inHand = true;
+        p.hands().add(new Player.Hand(amount));
+        p.baseBet = amount;
+        p.contributed = amount;
+        log(p.name + (change ? " cambia la puntata: " : " punta ") + fmt(amount) + byHostNote(byHost));
+        changed();
+    }
+
+    /** Chiude le puntate: da qui si giocano le carte. */
+    public synchronized void bjDeal() {
+        if (st.stage != STAGE_BJ_BETS) {
+            throw new GameException("Le puntate non sono aperte");
+        }
+        int n = 0;
+        int total = 0;
+        for (Player p : st.players) {
+            if (p.inHand) {
+                n++;
+                total += p.contributed;
+            }
+        }
+        if (n == 0) {
+            throw new GameException("Nessuno ha ancora puntato");
+        }
+        pushUndo("Chiusura delle puntate");
+        for (Player p : st.players) {
+            if (p.inHand) {
+                p.lastBet = p.baseBet;
+            }
+        }
+        st.stage = STAGE_BJ_PLAY;
+        log("Puntate chiuse: " + n + (n == 1 ? " giocatore, " : " giocatori, ") + fmt(total) + " sul tavolo. Carte!");
+        changed();
+    }
+
+    private Player.Hand openHand(Player p, int index) {
+        if (st.stage != STAGE_BJ_PLAY) {
+            throw new GameException("Le carte non sono ancora state distribuite");
+        }
+        if (!p.inHand) {
+            throw new GameException(p.name + " non gioca questa mano");
+        }
+        if (index < 0 || index >= p.hands().size()) {
+            throw new GameException("Mano non valida");
+        }
+        Player.Hand h = p.hands().get(index);
+        if (h.outcome != Player.BJ_NONE) {
+            throw new GameException("Questa mano è già chiusa");
+        }
+        return h;
+    }
+
+    private static String handLabel(Player p, int index) {
+        return p.hands().size() > 1 ? " la mano " + (index + 1) : "";
+    }
+
+    public synchronized void bjDouble(int pid, int index, boolean byHost) {
+        Player p = require(pid);
+        Player.Hand h = openHand(p, index);
+        if (h.doubled) {
+            throw new GameException("Mano già raddoppiata");
+        }
+        if (p.stack < h.bet) {
+            throw new GameException("Servono altre " + fmt(h.bet) + " fiches per raddoppiare");
+        }
+        pushUndo(p.name + ": raddoppia");
+        p.stack -= h.bet;
+        p.contributed += h.bet;
+        h.bet *= 2;
+        h.doubled = true;
+        log(p.name + " raddoppia" + handLabel(p, index) + ": in gioco " + fmt(h.bet) + byHostNote(byHost));
+        changed();
+    }
+
+    public synchronized void bjSplit(int pid, int index, boolean byHost) {
+        Player p = require(pid);
+        Player.Hand h = openHand(p, index);
+        if (h.doubled) {
+            throw new GameException("Non puoi dividere una mano raddoppiata");
+        }
+        if (p.hands().size() >= 4) {
+            throw new GameException("Massimo 4 mani");
+        }
+        if (p.stack < h.bet) {
+            throw new GameException("Servono altre " + fmt(h.bet) + " fiches per dividere");
+        }
+        pushUndo(p.name + ": divide");
+        String label = handLabel(p, index);
+        p.stack -= h.bet;
+        p.contributed += h.bet;
+        p.hands().add(index + 1, new Player.Hand(h.bet));
+        log(p.name + " divide" + label + ": ora ha " + p.hands().size() + " mani" + byHostNote(byHost));
+        changed();
+    }
+
+    public synchronized void bjInsure(int pid, boolean byHost) {
+        Player p = require(pid);
+        if (st.stage != STAGE_BJ_PLAY || !p.inHand) {
+            throw new GameException("Assicurazione non disponibile ora");
+        }
+        if (p.insurance > 0) {
+            throw new GameException("Assicurazione già presa");
+        }
+        int amount = p.baseBet / 2;
+        if (amount < 1) {
+            throw new GameException("Puntata troppo bassa per l'assicurazione");
+        }
+        if (p.stack < amount) {
+            throw new GameException("Servono " + fmt(amount) + " fiches per l'assicurazione");
+        }
+        pushUndo(p.name + ": assicurazione");
+        p.stack -= amount;
+        p.contributed += amount;
+        p.insurance = amount;
+        log(p.name + " si assicura per " + fmt(amount) + byHostNote(byHost));
+        changed();
+    }
+
+    public synchronized void bjSurrender(int pid, int index, boolean byHost) {
+        Player p = require(pid);
+        Player.Hand h = openHand(p, index);
+        if (p.hands().size() > 1 || h.doubled) {
+            throw new GameException("La resa si può fare solo sulla mano iniziale");
+        }
+        pushUndo(p.name + ": resa");
+        h.outcome = Player.BJ_SURRENDER;
+        log(p.name + " si arrende: riavrà " + fmt(h.bet / 2) + byHostNote(byHost));
+        changed();
+    }
+
+    /**
+     * Il banco paga le mani.
+     *
+     * @param outcomes        per ogni giocatore in gioco l'esito di ciascuna mano (Player.BJ_*)
+     * @param dealerBlackjack il banco ha fatto blackjack: l'assicurazione paga 2:1
+     */
+    public synchronized void bjSettle(Map<Integer, int[]> outcomes, boolean dealerBlackjack) {
+        if (st.stage != STAGE_BJ_PLAY) {
+            throw new GameException("Non ci sono mani da pagare");
+        }
+        for (Player p : st.players) {
+            if (!p.inHand) {
+                continue;
+            }
+            int[] o = outcomes.get(p.id);
+            if (o == null || o.length != p.hands().size()) {
+                throw new GameException("Scegli l'esito di tutte le mani di " + p.name);
+            }
+            for (int i = 0; i < o.length; i++) {
+                boolean surrendered = p.hands().get(i).outcome == Player.BJ_SURRENDER;
+                if (!surrendered && (o[i] < Player.BJ_LOSE || o[i] > Player.BJ_SURRENDER)) {
+                    throw new GameException("Scegli l'esito di tutte le mani di " + p.name);
+                }
+            }
+        }
+        pushUndo("Pagamento delle mani");
+        int house = 0;
+        StringBuilder result = new StringBuilder();
+        for (Player p : st.players) {
+            if (!p.inHand) {
+                continue;
+            }
+            int[] o = outcomes.get(p.id);
+            int payout = 0;
+            StringBuilder what = new StringBuilder();
+            for (int i = 0; i < o.length; i++) {
+                Player.Hand h = p.hands().get(i);
+                if (h.outcome != Player.BJ_SURRENDER) {
+                    h.outcome = o[i];
+                }
+                payout += h.payout();
+                if (i > 0) {
+                    what.append(", ");
+                }
+                what.append(OUTCOMES[h.outcome]);
+            }
+            if (p.insurance > 0) {
+                if (dealerBlackjack) {
+                    payout += 3 * p.insurance;
+                }
+                what.append(dealerBlackjack ? ", assicurazione pagata" : ", assicurazione persa");
+            }
+            int net = payout - p.contributed;
+            house -= net;
+            p.stack += payout;
+            log(p.name + " " + signed(net) + " (" + what + ")");
+            if (result.length() > 0) {
+                result.append(" · ");
+            }
+            result.append(p.name).append(' ').append(signed(net));
+        }
+        st.houseNet += house;
+        log("Banco " + signed(house) + " in questa mano");
+        result.append(" · Banco ").append(signed(house));
+        st.lastResult = result.toString();
+        endHand();
+        changed();
+    }
+
+    // ------------------------------------------------------------------
     // Annulla
     // ------------------------------------------------------------------
 
@@ -1061,12 +1367,38 @@ public final class Game {
         if (m.containsKey("locked")) {
             n.locked = "1".equals(m.get("locked")) || "true".equals(m.get("locked"));
         }
+        if (m.containsKey("game")) {
+            String g = m.get("game").trim();
+            if (!GAME_POKER.equals(g) && !GAME_BLACKJACK.equals(g)) {
+                throw new GameException("Gioco sconosciuto");
+            }
+            if (!g.equals(cfg.game) && st.stage != STAGE_IDLE) {
+                throw new GameException("Puoi cambiare gioco solo tra una mano e l'altra");
+            }
+            n.game = g;
+        }
+        if (m.containsKey("bjMin")) {
+            n.bjMin = parseInt(m.get("bjMin"), "Puntata minima", 1, MAX_CHIPS);
+        }
+        if (m.containsKey("bjMax")) {
+            n.bjMax = parseInt(m.get("bjMax"), "Puntata massima", 0, MAX_CHIPS);
+        }
+        if (n.bjMax > 0 && n.bjMax < n.bjMin) {
+            throw new GameException("La puntata massima non può essere minore della minima");
+        }
         if (n.smallBlind > n.bigBlind) {
             throw new GameException("Lo small blind non può superare il big blind");
         }
         boolean blindsChanged = n.smallBlind != cfg.smallBlind || n.bigBlind != cfg.bigBlind || n.ante != cfg.ante;
+        boolean gameChanged = !n.game.equals(cfg.game);
+        if (gameChanged && !m.containsKey("tableName")
+                && (DEFAULT_NAME_POKER.equals(n.tableName) || DEFAULT_NAME_BLACKJACK.equals(n.tableName))) {
+            n.tableName = GAME_BLACKJACK.equals(n.game) ? DEFAULT_NAME_BLACKJACK : DEFAULT_NAME_POKER;
+        }
         cfg = n;
-        if (blindsChanged) {
+        if (gameChanged) {
+            log(blackjack() ? "Si gioca a blackjack: ognuno punta contro il banco" : "Si gioca a poker");
+        } else if (blindsChanged && !blackjack()) {
             log("Nuovi bui " + fmt(n.smallBlind) + "/" + fmt(n.bigBlind)
                     + (n.ante > 0 ? " ante " + fmt(n.ante) : "") + " (dalla prossima mano)");
         }
@@ -1183,6 +1515,10 @@ public final class Game {
         return st.currentBet;
     }
 
+    synchronized int houseNet() {
+        return st.houseNet;
+    }
+
     synchronized int pot() {
         return potTotal();
     }
@@ -1201,7 +1537,7 @@ public final class Game {
 
     public synchronized String stateJson(Player me, boolean admin, List<String> urls) {
         Json j = new Json().obj();
-        j.put("v", version).put("sid", instanceId).put("admin", admin);
+        j.put("v", version).put("sid", instanceId).put("admin", admin).put("houseNet", st.houseNet);
         j.key("me");
         if (me != null) {
             j.val(me.id);
@@ -1218,14 +1554,24 @@ public final class Game {
                 .put("autoBlinds", cfg.autoBlinds)
                 .put("chipValue", cfg.chipValue)
                 .put("currency", cfg.currency)
-                .put("locked", cfg.locked);
+                .put("locked", cfg.locked)
+                .put("game", cfg.game)
+                .put("bjMin", cfg.bjMin)
+                .put("bjMax", cfg.bjMax);
         j.key("chips").arr();
         for (int c : cfg.chips) {
             j.val(c);
         }
         j.endArr().end();
 
-        String stage = st.stage == STAGE_BETTING ? "betting" : st.stage == STAGE_SHOWDOWN ? "showdown" : "idle";
+        String stage;
+        switch (st.stage) {
+            case STAGE_BETTING: stage = "betting"; break;
+            case STAGE_SHOWDOWN: stage = "showdown"; break;
+            case STAGE_BJ_BETS: stage = "bj-bets"; break;
+            case STAGE_BJ_PLAY: stage = "bj-play"; break;
+            default: stage = "idle";
+        }
         int total = potTotal();
         j.key("hand").obj()
                 .put("n", st.handNumber)
@@ -1320,7 +1666,16 @@ public final class Game {
                 .put("buyIn", p.buyIn)
                 .put("cashOut", p.cashOut)
                 .put("pending", p.pendingChips)
-                .end();
+                .put("insurance", p.insurance)
+                .put("baseBet", p.baseBet)
+                .put("lastBet", p.lastBet);
+        j.key("hands").arr();
+        if (p.hands != null) {
+            for (Player.Hand h : p.hands) {
+                j.obj().put("bet", h.bet).put("doubled", h.doubled).put("outcome", h.outcome).end();
+            }
+        }
+        j.endArr().end();
     }
 
     // ------------------------------------------------------------------

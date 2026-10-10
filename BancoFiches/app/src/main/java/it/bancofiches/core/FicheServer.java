@@ -4,6 +4,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -25,6 +26,9 @@ public final class FicheServer extends NanoHTTPD {
     }
 
     private static final long POLL_TIMEOUT_MS = 25_000;
+    /** Azioni che un giocatore fa per sé (o il banco per conto suo, passando pid). */
+    private static final List<String> PLAYER_ACTIONS = Arrays.asList(
+            "act", "sitout", "rename", "leave", "bjbet", "bjdouble", "bjsplit", "bjinsure", "bjsurrender");
     private static final String JSON = "application/json; charset=utf-8";
 
     private final Game game;
@@ -161,7 +165,7 @@ public final class FicheServer extends NanoHTTPD {
                     .key("state").raw(state(p, admin))
                     .end().toString());
         }
-        if ("act".equals(path) || "sitout".equals(path) || "rename".equals(path) || "leave".equals(path)) {
+        if (PLAYER_ACTIONS.contains(path)) {
             int pid = targetPlayer(prm, me, admin);
             boolean byHost = admin && (me == null || me.getId() != pid);
             if ("act".equals(path)) {
@@ -170,6 +174,16 @@ public final class FicheServer extends NanoHTTPD {
                 game.setSittingOut(pid, "1".equals(prm.get("value")));
             } else if ("rename".equals(path)) {
                 game.rename(pid, prm.get("name"));
+            } else if ("bjbet".equals(path)) {
+                game.bjBet(pid, intParam(prm, "amount"), byHost);
+            } else if ("bjdouble".equals(path)) {
+                game.bjDouble(pid, intOr(prm.get("hand"), 0), byHost);
+            } else if ("bjsplit".equals(path)) {
+                game.bjSplit(pid, intOr(prm.get("hand"), 0), byHost);
+            } else if ("bjinsure".equals(path)) {
+                game.bjInsure(pid, byHost);
+            } else if ("bjsurrender".equals(path)) {
+                game.bjSurrender(pid, intOr(prm.get("hand"), 0), byHost);
             } else {
                 game.removePlayer(pid, byHost);
                 if (!byHost) {
@@ -188,6 +202,10 @@ public final class FicheServer extends NanoHTTPD {
         } else if ("add".equals(path)) {
             // Giocatore senza telefono: il banco agirà per lui.
             game.join(prm.get("name"));
+        } else if ("bjdeal".equals(path)) {
+            game.bjDeal();
+        } else if ("bjsettle".equals(path)) {
+            game.bjSettle(parseOutcomes(str(prm, "o")), "1".equals(prm.get("dbj")));
         } else if ("award".equals(path)) {
             game.award(parseWinners(str(prm, "w")));
         } else if ("cancel".equals(path)) {
@@ -254,6 +272,28 @@ public final class FicheServer extends NanoHTTPD {
             for (int k = 0; k < ids.length; k++) {
                 out[i][k] = parseIntStrict(ids[k].trim());
             }
+        }
+        return out;
+    }
+
+    /** Formato: "3=W,L;5=B" = giocatore 3: prima mano vinta, seconda persa; giocatore 5: blackjack. */
+    static Map<Integer, int[]> parseOutcomes(String o) {
+        Map<Integer, int[]> out = new HashMap<Integer, int[]>();
+        for (String part : o.split(";")) {
+            if (part.trim().isEmpty()) {
+                continue;
+            }
+            int eq = part.indexOf('=');
+            if (eq < 0) {
+                throw new GameException("Esiti non validi");
+            }
+            String[] codes = part.substring(eq + 1).split(",");
+            int[] res = new int[codes.length];
+            for (int i = 0; i < codes.length; i++) {
+                String c = codes[i].trim();
+                res[i] = "L".equals(c) ? 1 : "P".equals(c) ? 2 : "W".equals(c) ? 3 : "B".equals(c) ? 4 : "S".equals(c) ? 5 : 0;
+            }
+            out.put(parseIntStrict(part.substring(0, eq)), res);
         }
         return out;
     }
